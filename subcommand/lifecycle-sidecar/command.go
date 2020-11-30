@@ -4,6 +4,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -12,9 +13,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/common/expfmt"
+
 	"github.com/hashicorp/consul-k8s/subcommand/common"
 	"github.com/hashicorp/consul-k8s/subcommand/flags"
 	"github.com/mitchellh/cli"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
 type Command struct {
@@ -99,6 +104,7 @@ func (c *Command) Run(args []string) int {
 	// The loop will only exit when the Pod is shut down and we receive a SIGINT.
 	for {
 		cmd := exec.Command(c.flagConsulBinary, c.consulCommand...)
+		go runMetricsServer()
 
 		// Run the command and record the stdout and stderr output
 		output, err := cmd.CombinedOutput()
@@ -117,6 +123,46 @@ func (c *Command) Run(args []string) int {
 			return 0
 		}
 	}
+}
+
+// TODO: teardown on interrupt
+func runMetricsServer() {
+	// without the registry it was panicking
+	// see https://github.com/prometheus/client_golang/issues/716
+	// need to decide what to do when actually merging metrics
+	reg := prometheus.NewRegistry()
+	opsProcessed := promauto.With(reg).NewCounter(prometheus.CounterOpts{
+		Name: "myapp_processed_ops_total",
+		Help: "The total number of processed events",
+	})
+	recordMetrics(opsProcessed)
+	// panic: http: multiple registrations for /stats/prometheus
+	// so changed it to not use the promhttp handler
+	mfs, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		panic(err)
+	}
+	http.HandleFunc("/stats/prometheus", func(writer http.ResponseWriter, request *http.Request) {
+		for _, mf := range mfs {
+			if mf.Help != nil && *mf.Help == "test histogram bucket" {
+				if _, err := expfmt.MetricFamilyToText(writer, mf); err != nil {
+					if err != nil {
+						panic(err)
+					}
+				}
+			}
+		}
+	})
+	http.ListenAndServe(":20100", nil)
+}
+
+func recordMetrics(opsProcessed prometheus.Counter) {
+	go func() {
+		for {
+			opsProcessed.Inc()
+			time.Sleep(2 * time.Second)
+		}
+	}()
 }
 
 // validateFlags validates the flags.
